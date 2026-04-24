@@ -1,0 +1,47 @@
+schema_id: memlink_shrine_default_v2
+description: >
+  Memlink Shrine v2 默认主 ID 展示规则。主 ID 是给人和 AI 快速理解
+  记忆位置的可读编码，不是唯一不可变身份。后续用户可以改这个文件，
+  形成自己的编码习惯。
+
+pattern: "{graph_domain}-{subgraph}-{position}-{role_code}-{write_date}-{serial}"
+
+segments:
+  graph_domain:
+    meaning: 图谱域
+    examples:
+      ML: Memlink Shrine
+      WMT: Walmart 客户图谱
+  subgraph:
+    meaning: 子图域
+    examples:
+      RET: 调取机制
+      ENC: 编码机制
+      RAG: RAG 与 Memory 关系
+  position:
+    meaning: 当前节点在路径中的位置
+    examples:
+      R00: 原点
+      M01: 主线 1
+      A01: 支线 A 的第 1 个点
+      B01: 支线 B 的第 1 个点
+  role_code:
+    meaning: 当前节点角色
+    values:
+      RT: 原点
+      BR: 岔路
+      MN: 节点
+      DD: 死路
+      LM: 地标
+      IN: 汇合点
+      EX: 出口
+  write_date:
+    meaning: 写入日期，固定按北京时间 YYYYMMDD
+  serial:
+    meaning: 稳定流水号，默认由底层 raw_memory_id 生成，后续可改为当天递增号
+
+ui_order:
+  - 上游主ID
+  - 主ID
+  - 下游主ID
+
