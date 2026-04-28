@@ -29,6 +29,7 @@ from .direct_write import (
 )
 from .models import CatalogCard
 from .project_fusion import ProjectFusionResolver
+from .runtime_paths import resource_root
 from .session_auto_writer import (
     load_state as load_session_auto_writer_state,
     read_session_gate,
@@ -1091,15 +1092,39 @@ def api_sync(request: SyncRequest) -> dict:
 def index() -> str:
     import base64, pathlib
 
-    def _b64(path: str) -> str:
-        return base64.b64encode(pathlib.Path(path).read_bytes()).decode()
+    asset_root = resource_root() / "assets"
+    fallback_root = pathlib.Path(r"C:\Users\Administrator\Desktop\memory\图标")
 
-    shrine_b64 = _b64(r"C:\Users\Administrator\Desktop\memory\图标\shrine_statue_crop.png")
-    bg_b64     = _b64(r"C:\Users\Administrator\Desktop\memory\图标\g4.png")
-    icon1_b64  = _b64(r"C:\Users\Administrator\Desktop\memory\图标\icon_1.png")
-    icon2_b64  = _b64(r"C:\Users\Administrator\Desktop\memory\图标\icon_2.png")
-    icon3_b64  = _b64(r"C:\Users\Administrator\Desktop\memory\图标\icon_3.png")
-    icon4_b64  = _b64(r"C:\Users\Administrator\Desktop\memory\图标\icon_4.png")
+    def _b64(*candidates: pathlib.Path) -> str:
+        for candidate in candidates:
+            if candidate and candidate.exists():
+                return base64.b64encode(candidate.read_bytes()).decode()
+        raise FileNotFoundError(f"Missing asset candidates: {candidates}")
+
+    shrine_b64 = _b64(
+        fallback_root / "shrine_statue_crop.png",
+        asset_root / "memlink_shrine_lit.png",
+    )
+    bg_b64 = _b64(
+        fallback_root / "g4.png",
+        asset_root / "memlink_shrine_panel_bg.png",
+    )
+    icon1_b64 = _b64(
+        fallback_root / "icon_1.png",
+        asset_root / "memlink_shrine_lit.png",
+    )
+    icon2_b64 = _b64(
+        fallback_root / "icon_2.png",
+        asset_root / "memlink_shrine_unlit.png",
+    )
+    icon3_b64 = _b64(
+        fallback_root / "icon_3.png",
+        asset_root / "memlink_shrine_dropdown_arrow.png",
+    )
+    icon4_b64 = _b64(
+        fallback_root / "icon_4.png",
+        asset_root / "memlink_shrine_panel_bg.png",
+    )
 
     html = dedent(
         """

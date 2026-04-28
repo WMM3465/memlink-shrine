@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['C:\\Users\\Administrator\\Desktop\\memory\\MemlinkShrine\\launcher.py'],
+    ['C:\\Users\\Administrator\\Desktop\\memory\\MemlinkShrine\\quick_start_launcher.py'],
     pathex=[],
     binaries=[],
     datas=[],
@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='MemlinkShrine启动器',
+    name='MemlinkShrineQuickStart',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -36,5 +36,3 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
-
-

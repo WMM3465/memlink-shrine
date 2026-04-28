@@ -4,8 +4,10 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from .runtime_paths import runtime_data_root
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+PROJECT_ROOT = runtime_data_root().parent
 
 
 @dataclass
@@ -29,7 +31,7 @@ class Settings:
 
 
 def load_settings() -> Settings:
-    default_db_path = PROJECT_ROOT / "data" / "memlink_shrine.db"
+    default_db_path = runtime_data_root() / "memlink_shrine.db"
     bridge_root_text = os.getenv("VCP_BRIDGE_ROOT_PATH", "").strip()
     bridge_root = Path(bridge_root_text).resolve() if bridge_root_text else None
     vcp_root_text = os.getenv("VCP_ROOT_PATH", "").strip()

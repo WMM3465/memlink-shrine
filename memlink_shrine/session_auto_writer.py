@@ -15,6 +15,7 @@ from .db import init_db
 from .direct_write import create_direct_card
 from .id_schema import build_default_main_id
 from .models import CatalogCard
+from .runtime_paths import runtime_root
 from .source_rules import DEFAULT_PARALLEL_RULE, infer_frontend_name
 
 
@@ -30,6 +31,7 @@ PASSIVE_TRIGGERS = (
     "存起来",
     "存进memory",
 )
+SESSION_ID_PATTERN = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", re.IGNORECASE)
 
 
 @dataclass
@@ -64,7 +66,7 @@ class TickResult:
 
 
 def project_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+    return runtime_root()
 
 
 def data_path(relative: Path) -> Path:
@@ -255,22 +257,53 @@ def find_session_file(session_id: str) -> Path | None:
     return max(matches, key=lambda path: path.stat().st_mtime)
 
 
+def session_id_from_path(path: Path) -> str:
+    match = SESSION_ID_PATTERN.search(path.name)
+    return match.group(1) if match else path.stem
+
+
 def discover_sessions(limit: int = 4) -> list[SessionSnapshot]:
-    snapshots: list[SessionSnapshot] = []
-    for row in latest_session_rows(limit=limit):
+    rows_by_id: dict[str, dict[str, Any]] = {}
+    snapshots_by_id: dict[str, SessionSnapshot] = {}
+    row_limit = max(limit * 3, limit)
+    for row in latest_session_rows(limit=row_limit):
         session_id = str(row.get("id") or "").strip()
+        if session_id:
+            rows_by_id[session_id] = row
         path = find_session_file(session_id)
         if not path:
             continue
-        snapshots.append(
-            SessionSnapshot(
+        snapshots_by_id[session_id] = SessionSnapshot(
+            session_id=session_id,
+            thread_name=str(row.get("thread_name") or "Codex 会话").strip() or "Codex 会话",
+            updated_at=str(row.get("updated_at") or ""),
+            path=path,
+        )
+
+    sessions_root = codex_home() / "sessions"
+    if sessions_root.exists():
+        recent_files = sorted(
+            sessions_root.rglob("rollout-*.jsonl"),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )[: max(row_limit, 12)]
+        for path in recent_files:
+            session_id = session_id_from_path(path)
+            row = rows_by_id.get(session_id, {})
+            updated_at = str(row.get("updated_at") or datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat())
+            thread_name = str(row.get("thread_name") or path.stem).strip() or "Codex 会话"
+            snapshots_by_id[session_id] = SessionSnapshot(
                 session_id=session_id,
-                thread_name=str(row.get("thread_name") or "Codex 会话").strip() or "Codex 会话",
-                updated_at=str(row.get("updated_at") or ""),
+                thread_name=thread_name,
+                updated_at=updated_at,
                 path=path,
             )
-        )
-    return snapshots
+
+    return sorted(
+        snapshots_by_id.values(),
+        key=lambda snapshot: snapshot.path.stat().st_mtime,
+        reverse=True,
+    )[:limit]
 
 
 def read_new_jsonl(path: Path, offset: int) -> tuple[list[dict[str, Any]], int]:
@@ -379,6 +412,42 @@ def buffer_fingerprint(buffer: list[dict[str, str]]) -> str:
 
 def message_dicts(messages: list[SessionMessage]) -> list[dict[str, str]]:
     return [{"timestamp": msg.timestamp, "role": msg.role, "text": msg.text} for msg in messages]
+
+
+def message_timestamp(msg: dict[str, str] | SessionMessage) -> float:
+    if isinstance(msg, SessionMessage):
+        return parse_iso_to_timestamp(msg.timestamp)
+    return parse_iso_to_timestamp(str(msg.get("timestamp") or ""))
+
+
+def maybe_reset_segment(
+    session_state: dict[str, Any],
+    buffer: list[dict[str, str]],
+    new_messages: list[SessionMessage],
+    *,
+    gap_hours: float,
+) -> tuple[list[dict[str, str]], str | None]:
+    if not buffer or not new_messages or gap_hours <= 0:
+        return buffer, None
+    previous_messages = buffer[: -len(new_messages)] if len(new_messages) <= len(buffer) else []
+    if not previous_messages:
+        return buffer, None
+    previous_ts = message_timestamp(previous_messages[-1])
+    first_new_ts = message_timestamp(new_messages[0])
+    if not previous_ts or not first_new_ts:
+        return buffer, None
+    gap_seconds = first_new_ts - previous_ts
+    if gap_seconds < gap_hours * 3600:
+        return buffer, None
+
+    anchor = str(session_state.get("last_card_main_id") or "").strip()
+    reset_note = f"断档续写：距离上次线程推进约 {gap_seconds / 3600:.1f} 小时；触发计数从新片段重开"
+    if anchor:
+        reset_note += f"，链路接回 {anchor}"
+    session_state["last_segment_reset_at"] = CatalogCard.now_iso()
+    session_state["last_segment_gap_hours"] = round(gap_seconds / 3600, 2)
+    session_state["last_segment_resume_anchor_main_id"] = anchor
+    return message_dicts(new_messages), reset_note
 
 
 def buffer_text(buffer: list[dict[str, str]], max_chars: int = 18000) -> str:
@@ -501,6 +570,8 @@ def decide_trigger(
         return TriggerDecision(False, "Memlink Shrine 熄火，暂停写入；读取层仍在线。", mode)
     if not buffer:
         return TriggerDecision(False, "没有可写入的新对话。", mode)
+    if not new_messages:
+        return TriggerDecision(False, "没有新的线程推进消息。", mode)
 
     passive_hit = any(
         msg.role == "user" and any(trigger in msg.text for trigger in PASSIVE_TRIGGERS)
@@ -1091,6 +1162,7 @@ def tick(
     turn_threshold = turn_threshold or int(os.getenv("MEMLINK_SHRINE_AUTO_TURN_THRESHOLD", "8"))
     char_threshold = char_threshold or int(os.getenv("MEMLINK_SHRINE_AUTO_CHAR_THRESHOLD", "12000"))
     hours_threshold = hours_threshold or float(os.getenv("MEMLINK_SHRINE_AUTO_HOURS_THRESHOLD", "0.5"))
+    max_backlog_bytes = int(os.getenv("MEMLINK_SHRINE_MAX_SESSION_BACKLOG_BYTES", str(1024 * 1024)))
 
     for snapshot in discover_sessions(limit=session_limit):
         result.checked_sessions += 1
@@ -1102,14 +1174,29 @@ def tick(
             result.skipped.append(f"{snapshot.thread_name}: 熄火，暂停写入")
             continue
 
+        file_size = snapshot.path.stat().st_size
+        offset = int(session_state.get("offset") or 0)
+        if max_backlog_bytes > 0 and file_size - offset > max_backlog_bytes:
+            session_state["offset"] = file_size
+            session_state["buffer"] = []
+            result.skipped.append(f"{snapshot.thread_name}: 会话积压过大，已追平到当前末尾；等待下一次真实推进")
+            continue
+
         events, new_offset = read_new_jsonl(snapshot.path, int(session_state.get("offset") or 0))
         new_messages = extract_messages(events)
         result.new_messages += len(new_messages)
         if new_messages:
             buffer = trim_buffer(list(session_state.get("buffer") or []) + message_dicts(new_messages))
+            buffer, segment_reset_note = maybe_reset_segment(
+                session_state,
+                buffer,
+                new_messages,
+                gap_hours=float(os.getenv("MEMLINK_SHRINE_SEGMENT_GAP_HOURS", "24")),
+            )
             session_state["buffer"] = buffer
         else:
             buffer = list(session_state.get("buffer") or [])
+            segment_reset_note = None
 
         session_state["offset"] = new_offset
         decision = decide_trigger(
@@ -1134,6 +1221,8 @@ def tick(
         if not final_decision.should_write:
             result.skipped.append(f"{snapshot.thread_name}: {final_decision.reason}")
             continue
+        if segment_reset_note:
+            final_decision.reason = f"{final_decision.reason}；{segment_reset_note}"
         should_confirm = final_decision.mode == "passive"
         if should_confirm:
             draft = queue_pending_draft(

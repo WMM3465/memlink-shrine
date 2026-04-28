@@ -2,7 +2,7 @@ param(
     [int]$PollSeconds = 5,
     [int]$StartupDelaySeconds = 10,
     [switch]$KeepOpenMemoryOnCodexExit,
-    [switch]$OpenBrowserOnStart,
+    [switch]$NoBrowserOnStart,
     [string]$CodexHealthUrl = "https://api.openai.com/v1/models"
 )
 
@@ -105,7 +105,7 @@ function Start-MemoryRuntime {
         throw "Missing start script: $startScript"
     }
     $args = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $startScript)
-    if (-not $OpenBrowserOnStart) {
+    if ($NoBrowserOnStart) {
         $args += "-NoBrowser"
     }
     Start-Process -FilePath "powershell.exe" -ArgumentList $args -WindowStyle Hidden

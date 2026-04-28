@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -17,6 +18,8 @@ from tkinter import BooleanVar, StringVar, Tk, Toplevel, Canvas, Label, Frame, B
 from tkinter import ttk
 from ctypes import wintypes
 
+from .runtime_paths import resource_root, runtime_data_root
+
 try:
     from PIL import Image, ImageTk, ImageOps, ImageDraw
 except Exception:  # pragma: no cover - Pillow is optional at runtime.
@@ -27,9 +30,22 @@ except Exception:  # pragma: no cover - Pillow is optional at runtime.
 
 
 API_BASE = os.getenv("MEMLINK_SHRINE_API_BASE", "http://127.0.0.1:7861").rstrip("/")
-ROOT_DIR = Path(__file__).resolve().parents[1]
+ROOT_DIR = resource_root()
+DATA_DIR = runtime_data_root()
 ICON_DIR = ROOT_DIR / "assets"
-FALLBACK_ICON_DIR = ROOT_DIR.parents[3] / "图标"
+
+
+def _workspace_root() -> Path:
+    for candidate in (ROOT_DIR, *ROOT_DIR.parents):
+        if candidate.name.lower() == "memory":
+            return candidate
+        if (candidate / "图标").exists() or (candidate / "__inspect_vcp_toolbox").exists():
+            return candidate
+    return ROOT_DIR.parent
+
+
+MEMORY_WORKSPACE_ROOT = _workspace_root()
+FALLBACK_ICON_DIR = MEMORY_WORKSPACE_ROOT / "图标"
 
 
 def _asset_path(primary_name: str, fallback_name: str | None = None) -> Path | None:
@@ -75,6 +91,16 @@ WITNESS_SECTION_COVER_RECT = (42, 760, 1560, 1380)
 ADMIN_SECTION_COVER_RECT = (42, 1230, 1560, 1860)
 VCP_SECTION_COVER_RECT = (42, 1700, 1560, 2478)
 TRANSPARENT = "#ff00ff"
+CONVERSATION_ID_RE = re.compile(r"conversationId=([0-9a-fA-F-]{36})")
+ACTIVE_THREAD_SELECT_LOG_MARKERS = (
+    "registered browser sidebar thread",
+    "method=thread/read",
+    "method=thread/resume",
+)
+ACTIVE_THREAD_FALLBACK_LOG_MARKERS = (
+    "method=turn/start",
+    "method=turn/steer",
+)
 THEME_BG = "#15120f"
 THEME_PANEL = "#1c1815"
 THEME_CARD = "#26211d"
@@ -149,6 +175,13 @@ def _normalize_host_id(value: str | None) -> str:
     return clean or "default"
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
 HOST_ID = _normalize_host_id(None)
 HOST_WINDOW_TITLE = str(os.getenv("MEMLINK_SHRINE_HOST_WINDOW_TITLE") or "Codex").strip() or "Codex"
 HOST_REGION_LEFT = int(os.getenv("MEMLINK_SHRINE_HOST_REGION_LEFT") or "304")
@@ -162,14 +195,16 @@ RESIZE_PREVIEW_REFRESH_MS = int(os.getenv("MEMLINK_SHRINE_RESIZE_PREVIEW_REFRESH
 HOST_PRESENCE_GRACE_SECONDS = float(os.getenv("MEMLINK_SHRINE_HOST_PRESENCE_GRACE_SECONDS") or "1.2")
 RECOVERY_COOLDOWN_SECONDS = float(os.getenv("MEMLINK_SHRINE_RECOVERY_COOLDOWN_SECONDS") or "12")
 RECOVERY_RETRY_ON_FAILURE_SECONDS = float(os.getenv("MEMLINK_SHRINE_RECOVERY_RETRY_ON_FAILURE_SECONDS") or "6")
+STANDALONE_MODE = _env_flag("MEMLINK_SHRINE_STANDALONE", False)
+DISABLE_AUTO_RECOVERY = _env_flag("MEMLINK_SHRINE_DISABLE_AUTO_RECOVERY", False)
 
 
 def _position_path() -> Path:
-    return ROOT_DIR / "data" / f"memlink_shrine_overlay_position.{HOST_ID}.json"
+    return DATA_DIR / f"memlink_shrine_overlay_position.{HOST_ID}.json"
 
 
 def _legacy_position_path() -> Path:
-    return ROOT_DIR / "data" / "memlink_shrine_overlay_position.json"
+    return DATA_DIR / "memlink_shrine_overlay_position.json"
 
 
 def _request_json(method: str, path: str, payload: dict | None = None) -> dict:
@@ -253,7 +288,7 @@ def _load_position() -> dict[str, Any] | None:
 
 
 def _lifecycle_state_path() -> Path:
-    return ROOT_DIR / "data" / "memlink_shrine_codex_lifecycle_state.json"
+    return DATA_DIR / "memlink_shrine_codex_lifecycle_state.json"
 
 
 def _read_lifecycle_state() -> dict[str, Any]:
@@ -463,9 +498,12 @@ class MemlinkShrineOverlay:
         self.writer_status: dict[str, Any] = {}
         self.lifecycle_state: dict[str, Any] = {}
         self.last_status_refresh = 0.0
+        self.active_codex_session_id = ""
+        self.last_active_session_refresh = 0.0
         self.last_prompted_draft_id = ""
         self.last_panel_signature = ""
         self.last_prompt_signature = ""
+        self.last_empty_prompt_signature = ""
         self.snoozed_draft_id = ""
         self.pending_preview_expanded = False
         self.pending_prompt_is_empty = False
@@ -907,6 +945,10 @@ class MemlinkShrineOverlay:
             window.configure(cursor="arrow")
 
     def _window_wheel_scale(self, window, event):
+        # Normal wheel motion belongs to scrollable content. Scaling is opt-in to avoid
+        # accidental resize while reading a draft or panel.
+        if not (int(getattr(event, "state", 0) or 0) & 0x0004):
+            return None
         if not self._window_near_edge(window, event):
             return None
         delta = getattr(event, "delta", 0)
@@ -1015,6 +1057,24 @@ class MemlinkShrineOverlay:
         self.owner_sync_job = self.root.after(30, _run)
 
     def _sync_host_scope(self) -> None:
+        if STANDALONE_MODE:
+            screen_w = self.root.winfo_screenwidth()
+            screen_h = self.root.winfo_screenheight()
+            self.host_hwnd = 0
+            self.host_pid = 0
+            self.host_rect = (0, 0, screen_w, screen_h)
+            self.host_region = (8, 8, screen_w - 8, screen_h - 8)
+            self.host_visible = True
+            self._set_root_visible(True)
+            self._set_attached_windows_visible(
+                bool((self.panel and self.panel.winfo_exists()) or (self.pending_prompt and self.pending_prompt.winfo_exists()))
+            )
+            if self.panel and self.panel.winfo_exists() and not (self.dragging or self.resizing):
+                self._position_panel()
+            if self.pending_prompt and self.pending_prompt.winfo_exists() and not (self.dragging or self.resizing):
+                self._position_pending_prompt(empty=self.pending_prompt_is_empty)
+            return
+
         now = time.time()
         host = self._host_state()
         self.host_hwnd = int(host.get("hwnd") or 0) if host else 0
@@ -1059,6 +1119,9 @@ class MemlinkShrineOverlay:
     def _clean_mode(self) -> str:
         mode = str(self.state.get("mode") or "off")
         return "passive" if mode == "ask" else mode
+
+    def _write_gate_open(self) -> bool:
+        return self._clean_mode() != "off"
 
     def _load_icon_images(self) -> None:
         self.icon_sources = {}
@@ -1486,18 +1549,26 @@ class MemlinkShrineOverlay:
             self.connected = False
             self._maybe_recover_runtime()
         self._draw()
+        if not self._write_gate_open():
+            self._close_pending_prompt()
         if self.panel and self.panel.winfo_exists():
             self._refresh_panel_if_needed()
 
     def _refresh_writer_status(self) -> None:
         self.last_status_refresh = time.time()
         self.lifecycle_state = _read_lifecycle_state()
+        self._refresh_active_codex_session_id()
         try:
             self.writer_status = _request_json("GET", "/api/session-auto-writer-status")
             self.connected = True
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
             self.writer_status = {}
             self._maybe_recover_runtime()
+            return
+        if not self._write_gate_open():
+            self._close_pending_prompt()
+            if self.panel and self.panel.winfo_exists():
+                self._refresh_panel_if_needed()
             return
         self._maybe_prompt_pending_draft()
         if self.panel and self.panel.winfo_exists():
@@ -1509,9 +1580,9 @@ class MemlinkShrineOverlay:
         env["MEMLINK_SHRINE_API_BASE"] = API_BASE
         env["MEMLINK_SHRINE_HOST_ID"] = HOST_ID
         env["MEMLINK_SHRINE_HOST_WINDOW_TITLE"] = HOST_WINDOW_TITLE
-        env["MEMLINK_SHRINE_DB"] = str(ROOT_DIR / "data" / "memlink_shrine.db")
+        env["MEMLINK_SHRINE_DB"] = str(env.get("MEMLINK_SHRINE_DB") or (DATA_DIR / "memlink_shrine.db"))
 
-        vcp_root = ROOT_DIR.parents[3] / "__inspect_vcp_toolbox"
+        vcp_root = MEMORY_WORKSPACE_ROOT / "__inspect_vcp_toolbox"
         vcp_config = _parse_env_file(vcp_root / "config.env")
         if vcp_root.exists():
             env.setdefault("VCP_ROOT_PATH", str(vcp_root))
@@ -1557,6 +1628,8 @@ class MemlinkShrineOverlay:
             return False
 
     def _maybe_recover_runtime(self) -> None:
+        if DISABLE_AUTO_RECOVERY:
+            return
         now = time.time()
         cooldown = RECOVERY_COOLDOWN_SECONDS if self.last_recovery_error == "" else RECOVERY_RETRY_ON_FAILURE_SECONDS
         if now - self.last_recovery_attempt < cooldown:
@@ -1592,6 +1665,170 @@ class MemlinkShrineOverlay:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.timestamp()
 
+    def _codex_log_roots(self) -> list[Path]:
+        local_app_data = Path(os.getenv("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+        roots: list[Path] = []
+        package_root = local_app_data / "Packages"
+        for package in package_root.glob("OpenAI.Codex_*"):
+            candidate = package / "LocalCache" / "Local" / "Codex" / "Logs"
+            if candidate.exists():
+                roots.append(candidate)
+        fallback = local_app_data / "Codex" / "Logs"
+        if fallback.exists():
+            roots.append(fallback)
+        return roots
+
+    def _latest_codex_log_files(self, limit: int = 6) -> list[Path]:
+        files: list[Path] = []
+        for root in self._codex_log_roots():
+            try:
+                files.extend(path for path in root.rglob("*.log") if path.is_file())
+            except OSError:
+                continue
+        files.sort(key=lambda path: path.stat().st_mtime if path.exists() else 0, reverse=True)
+        return files[:limit]
+
+    def _read_log_tail(self, path: Path, max_bytes: int = 1024 * 1024) -> str:
+        try:
+            size = path.stat().st_size
+            with path.open("rb") as handle:
+                if size > max_bytes:
+                    handle.seek(size - max_bytes)
+                return handle.read().decode("utf-8", errors="ignore")
+        except OSError:
+            return ""
+
+    def _refresh_active_codex_session_id(self, *, force: bool = False) -> str:
+        now = time.time()
+        if not force and now - self.last_active_session_refresh < 1.2:
+            return self.active_codex_session_id
+        self.last_active_session_refresh = now
+        for path in self._latest_codex_log_files():
+            text = self._read_log_tail(path)
+            if not text:
+                continue
+            for line in reversed(text.splitlines()):
+                is_select_event = any(marker in line for marker in ACTIVE_THREAD_SELECT_LOG_MARKERS)
+                is_fallback_event = any(marker in line for marker in ACTIVE_THREAD_FALLBACK_LOG_MARKERS)
+                if not is_select_event and not is_fallback_event:
+                    continue
+                match = CONVERSATION_ID_RE.search(line)
+                if not match:
+                    continue
+                session_id = match.group(1).lower()
+                if session_id and session_id not in {"none", "null"}:
+                    self.active_codex_session_id = session_id
+                    return session_id
+        return self.active_codex_session_id
+
+    def _bind_mousewheel_tree(self, widget, handler) -> None:
+        if handler is None:
+            return
+        try:
+            widget.bind("<MouseWheel>", handler, add="+")
+        except Exception:
+            return
+        for child in widget.winfo_children():
+            self._bind_mousewheel_tree(child, handler)
+
+    def _format_cache_timestamp(self, value: str | None) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return "未知时间"
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(BEIJING_TZ).strftime("%m-%d %H:%M")
+        except ValueError:
+            return text[:16] if len(text) >= 16 else text
+
+    def _session_caches(self) -> list[dict[str, Any]]:
+        watcher_state = self.writer_status.get("watcher_state") if isinstance(self.writer_status, dict) else {}
+        sessions = watcher_state.get("sessions") if isinstance(watcher_state, dict) else {}
+        if not isinstance(sessions, dict):
+            return []
+        caches: list[dict[str, Any]] = []
+        for session_id, item in sessions.items():
+            if not isinstance(item, dict):
+                continue
+            raw_buffer = item.get("buffer")
+            if not isinstance(raw_buffer, list):
+                continue
+            buffer = [msg for msg in raw_buffer if isinstance(msg, dict) and str(msg.get("text") or "").strip()]
+            if not buffer:
+                continue
+            first_ts = str(buffer[0].get("timestamp") or "")
+            last_ts = str(buffer[-1].get("timestamp") or "")
+            score = max(
+                self._parse_iso_timestamp(last_ts),
+                self._parse_iso_timestamp(str(item.get("updated_at") or "")),
+                self._parse_iso_timestamp(str(item.get("initialized_at") or "")),
+            )
+            caches.append(
+                {
+                    "session_id": str(session_id),
+                    "thread_name": str(item.get("thread_name") or "Codex 会话"),
+                    "buffer": buffer,
+                    "message_count": len(buffer),
+                    "first_message_at": first_ts,
+                    "last_message_at": last_ts,
+                    "score": score,
+                    "last_card_main_id": str(item.get("last_card_main_id") or ""),
+                }
+            )
+        caches.sort(key=lambda row: float(row.get("score") or 0), reverse=True)
+        return caches
+
+    def _active_session_cache(self) -> dict[str, Any] | None:
+        caches = self._session_caches()
+        active_id = self._refresh_active_codex_session_id()
+        if active_id:
+            for cache in caches:
+                if str(cache.get("session_id") or "").lower() == active_id:
+                    return cache
+            return None
+        return None
+
+    def _session_name(self, session_id: str | None) -> str:
+        clean_id = str(session_id or "").strip().lower()
+        if not clean_id:
+            return "当前 Codex 线程"
+        watcher_state = self.writer_status.get("watcher_state") if isinstance(self.writer_status, dict) else {}
+        sessions = watcher_state.get("sessions") if isinstance(watcher_state, dict) else {}
+        item = sessions.get(clean_id) if isinstance(sessions, dict) else None
+        if isinstance(item, dict):
+            name = str(item.get("thread_name") or "").strip()
+            if name:
+                return name
+        for draft in self._pending_drafts():
+            if str(draft.get("session_id") or "").lower() == clean_id:
+                name = str(draft.get("thread_name") or "").strip()
+                if name:
+                    return name
+        return "当前 Codex 线程"
+
+    def _session_cache_signature(self) -> str:
+        cache = self._active_session_cache()
+        if not isinstance(cache, dict):
+            return ""
+        payload = {
+            "session_id": cache.get("session_id"),
+            "message_count": cache.get("message_count"),
+            "last_message_at": cache.get("last_message_at"),
+            "last_card_main_id": cache.get("last_card_main_id"),
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    def _empty_prompt_signature(self) -> str:
+        active_id = self._refresh_active_codex_session_id()
+        payload = {
+            "active_session_id": active_id,
+            "active_cache": self._session_cache_signature(),
+            "current_pending": self._pending_draft_signature(self._current_pending_draft(include_snoozed=True)),
+        }
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
     def _pending_drafts(self) -> list[dict]:
         drafts = self.writer_status.get("pending_drafts")
         if not isinstance(drafts, list) or not drafts:
@@ -1608,7 +1845,15 @@ class MemlinkShrineOverlay:
         return items
 
     def _current_pending_draft(self, *, include_snoozed: bool = False) -> dict | None:
+        if not self._write_gate_open():
+            return None
         drafts = self._pending_drafts()
+        if not drafts:
+            return None
+        active_id = self._refresh_active_codex_session_id()
+        if not active_id:
+            return None
+        drafts = [draft for draft in drafts if str(draft.get("session_id") or "").lower() == active_id]
         if not drafts:
             return None
         if include_snoozed:
@@ -1634,6 +1879,7 @@ class MemlinkShrineOverlay:
         self.pending_point_cards = []
         self.pending_raw_editor = None
         self.last_prompt_signature = ""
+        self.last_empty_prompt_signature = ""
 
     def _pending_draft_signature(self, draft: dict | None) -> str:
         if not isinstance(draft, dict):
@@ -1691,6 +1937,7 @@ class MemlinkShrineOverlay:
         return merged
 
     def _open_pending_prompt_from_panel(self) -> None:
+        self._refresh_active_codex_session_id(force=True)
         self.snoozed_draft_id = ""
         self.last_prompted_draft_id = ""
         self.last_prompt_signature = ""
@@ -1728,6 +1975,7 @@ class MemlinkShrineOverlay:
             "selected_models": self.state.get("selected_models", {}),
             "available_graphs": self.state.get("available_graphs", []),
             "pending_draft": self._current_pending_draft(),
+            "active_session_cache": self._session_cache_signature(),
         }
         try:
             return json.dumps(payload, ensure_ascii=False, sort_keys=True)
@@ -1775,6 +2023,10 @@ class MemlinkShrineOverlay:
 
         content.bind("<Configure>", _sync)
         canvas.bind("<Configure>", _sync)
+        outer._memlink_scroll_canvas = canvas
+        outer._memlink_scroll_handler = _on_wheel
+        content._memlink_scroll_handler = _on_wheel
+        outer.bind("<MouseWheel>", _on_wheel)
         canvas.bind("<MouseWheel>", _on_wheel)
         content.bind("<MouseWheel>", _on_wheel)
 
@@ -1833,10 +2085,18 @@ class MemlinkShrineOverlay:
     def _render_empty_pending_prompt(self) -> None:
         if not self.pending_prompt or not self.pending_prompt.winfo_exists():
             return
-        width, height = self._prompt_window_size(default_width=420, default_height=220)
+        active_id = self._refresh_active_codex_session_id()
+        cache = self._active_session_cache()
+        has_cache = isinstance(cache, dict)
+        needs_scroll = has_cache
+        width, height = self._prompt_window_size(
+            default_width=470 if needs_scroll else 420,
+            default_height=440 if needs_scroll else 230,
+        )
         self._set_window_geometry(self.pending_prompt, self.pending_prompt.winfo_x(), self.pending_prompt.winfo_y(), width, height)
         self._clear_pending_prompt_children()
         self.pending_prompt_is_empty = True
+        self.last_empty_prompt_signature = self._empty_prompt_signature()
         content = self._build_prompt_shell(
             self.pending_prompt,
             width=width,
@@ -1846,9 +2106,14 @@ class MemlinkShrineOverlay:
         )
 
         wraplength = max(260, width - 60)
+        body = content
+        outer = None
+        if needs_scroll:
+            outer, _, body = self._build_scrollable_area(content, bg=THEME_BG)
+
         Label(
-            content,
-            text="当前没有待确认残影草稿。命中写入阈值后，新草稿会出现在这里。",
+            body,
+            text="当前线程没有待确认残影草稿。",
             bg=THEME_BG,
             fg=PANEL_TEXT_GOLD,
             font=(PANEL_FONT_FAMILY, 12, "bold"),
@@ -1856,14 +2121,67 @@ class MemlinkShrineOverlay:
             justify="left",
         ).pack(anchor="w", pady=(8, 8), padx=10)
         Label(
-            content,
-            text="你也可以保持被动写入开启，等下一次草稿生成后直接从这里确认。",
+            body,
+            text=f"当前线程：{self._session_name(active_id)}",
             bg=THEME_BG,
-            fg=PANEL_TEXT_GOLD_MUTED,
+            fg=PANEL_TEXT_GOLD,
             font=(PANEL_FONT_FAMILY, 11, "normal"),
             wraplength=wraplength,
             justify="left",
         ).pack(anchor="w", padx=10)
+
+        if has_cache:
+            buffer = cache.get("buffer") if isinstance(cache.get("buffer"), list) else []
+            Label(
+                body,
+                text=f"缓存：{cache.get('message_count') or len(buffer)} 条消息；最近推进：{self._format_cache_timestamp(str(cache.get('last_message_at') or ''))}",
+                bg=THEME_BG,
+                fg=PANEL_TEXT_GOLD_MUTED,
+                font=(PANEL_FONT_FAMILY, 11, "normal"),
+                wraplength=wraplength,
+                justify="left",
+            ).pack(anchor="w", padx=10, pady=(4, 8))
+            Label(
+                body,
+                text="说明：这个线程还没命中轮数、字符量、时间或主动口令阈值，所以不会弹确认写入。",
+                bg=THEME_BG,
+                fg=PANEL_TEXT_GOLD_MUTED,
+                font=(PANEL_FONT_FAMILY, 10, "normal"),
+                wraplength=wraplength,
+                justify="left",
+            ).pack(anchor="w", padx=10, pady=(0, 10))
+            for index, msg in enumerate(buffer[-6:], start=max(1, len(buffer) - 5)):
+                role = "你" if str(msg.get("role") or "") == "user" else "Codex"
+                text = str(msg.get("text") or "").strip().replace("\r", " ").replace("\n", " ")
+                if len(text) > 180:
+                    text = f"{text[:177]}..."
+                Label(
+                    body,
+                    text=f"{index}. {role}：{text}",
+                    bg=THEME_BG,
+                    fg=PANEL_TEXT_GOLD,
+                    font=(PANEL_DETAIL_FONT_FAMILY, 10, "normal"),
+                    wraplength=wraplength,
+                    justify="left",
+                ).pack(anchor="w", padx=10, pady=(0, 8))
+
+        if not has_cache:
+            empty_text = (
+                "还没有识别到当前 Codex 线程 ID。请在当前线程发送或切换一次消息后再打开草稿箱。"
+                if not active_id
+                else "当前线程没有缓存。至少产生一条新的对话消息后，watcher 才会为这个线程建立独立缓存。"
+            )
+            Label(
+                body,
+                text=empty_text,
+                bg=THEME_BG,
+                fg=PANEL_TEXT_GOLD_MUTED,
+                font=(PANEL_FONT_FAMILY, 11, "normal"),
+                wraplength=wraplength,
+                justify="left",
+            ).pack(anchor="w", padx=10)
+        if outer is not None:
+            self._bind_mousewheel_tree(outer, getattr(outer, "_memlink_scroll_handler", None))
 
         row = Frame(content, bg=THEME_BG)
         row.pack(fill="x", side="bottom", pady=(18, 0), padx=10)
@@ -1992,6 +2310,7 @@ class MemlinkShrineOverlay:
         def add_point() -> None:
             fallback_graph = self.pending_graph_vars[-1].get().strip() if self.pending_graph_vars else (str(draft.get("thread_name") or "未归属项目").strip() or "未归属项目")
             build_point_card("", fallback_graph, "可直接补进遗漏内容，确认后按修改版写入。")
+            self._bind_mousewheel_tree(outer, getattr(outer, "_memlink_scroll_handler", None))
 
         add_btn = self._textured_button(
             add_row,
@@ -2050,6 +2369,7 @@ class MemlinkShrineOverlay:
             font=(PANEL_FONT_FAMILY, 11, "bold"),
         )
         close_btn.pack(side="right")
+        self._bind_mousewheel_tree(outer, getattr(outer, "_memlink_scroll_handler", None))
 
     def _preview_points(self, draft: dict | None) -> list[str]:
         preview = draft.get("preview", {}) if isinstance(draft, dict) and isinstance(draft.get("preview"), dict) else {}
@@ -2410,11 +2730,19 @@ class MemlinkShrineOverlay:
         self._refresh_writer_status()
 
     def _maybe_prompt_pending_draft(self, *, force: bool = False) -> None:
+        if not self._write_gate_open():
+            self.last_prompted_draft_id = ""
+            self.snoozed_draft_id = ""
+            self._close_pending_prompt()
+            return
         remote_draft = self._current_pending_draft()
         if not remote_draft:
             self.last_prompted_draft_id = ""
             self.snoozed_draft_id = ""
             if self.pending_prompt and self.pending_prompt.winfo_exists() and self.pending_prompt_is_empty:
+                signature = self._empty_prompt_signature()
+                if signature != self.last_empty_prompt_signature:
+                    self._render_empty_pending_prompt()
                 return
             self._close_pending_prompt()
             return
@@ -2467,6 +2795,8 @@ class MemlinkShrineOverlay:
             self.connected = True
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
             self.connected = False
+        if not self._write_gate_open():
+            self._close_pending_prompt()
         self._draw()
         if self.panel and self.panel.winfo_exists():
             self._fill_panel()
@@ -3128,11 +3458,16 @@ class MemlinkShrineOverlay:
             fill=panel_text,
             font=(PANEL_FONT_FAMILY, mf(12, 10), "bold"),
         )
+        current_pending_count = 1 if self._current_pending_draft(include_snoozed=True) else 0
+        active_cache = self._active_session_cache()
         self._panel_text(
             canvas,
             mx(16) + text_w + mx(24),
             y,
-            text=f"当前待确认：{len(self._pending_drafts())}",
+            text=(
+                f"当前待确认：{current_pending_count}"
+                + (f" / 缓存：{int(active_cache.get('message_count') or 0)}" if active_cache else "")
+            ),
             font=(PANEL_FONT_FAMILY, mf(12, 10), "bold"),
             fill=panel_muted,
         )
@@ -3281,6 +3616,7 @@ class MemlinkShrineOverlay:
         canvas.tag_bind(thumb, "<ButtonPress-1>", _thumb_press)
         canvas.tag_bind(thumb, "<B1-Motion>", _thumb_drag)
         canvas.tag_bind(thumb, "<ButtonRelease-1>", _thumb_release)
+        self._bind_mousewheel_tree(shell, _scroll_wheel)
         for child in old_children:
             try:
                 child.destroy()

@@ -10,6 +10,11 @@ venv/
 data/
 build/
 dist/
+docs/
+installer_payload/
+*.zip
+*.rar
+*.exe
 *.spec.bak
 
 .DS_Store
